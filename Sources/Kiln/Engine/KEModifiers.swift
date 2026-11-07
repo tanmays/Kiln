@@ -428,10 +428,37 @@ enum KModifiers {
         case "chartYAxis":
             if case .native(.implicit("hidden", _))? = first { return AnyView(view.chartYAxis(.hidden)) }
             return view
-        case "chartYScale":
-            if case .range(let lo, let hi, _)? = arg("domain"), let l = lo.asDouble, let h = hi.asDouble { return AnyView(view.chartYScale(domain: l...h)) }
+        case "chartYScale", "chartXScale":
+            let isY = m.name == "chartYScale"
+            switch arg("domain") {
+            case .range(let lo, let hi, _)?:
+                if let l = lo.asDouble, let h = hi.asDouble, l <= h {
+                    return isY ? AnyView(view.chartYScale(domain: l...h)) : AnyView(view.chartXScale(domain: l...h))
+                }
+                if case .native(.date(let l)) = lo, case .native(.date(let h)) = hi, l <= h {
+                    return isY ? AnyView(view.chartYScale(domain: l...h)) : AnyView(view.chartXScale(domain: l...h))
+                }
+            case .native(.implicit("automatic", let a))?:
+                // `.automatic(includesZero: false)`: implicit members drop their labels.
+                let includesZero = a.first?.asBool
+                return isY ? AnyView(view.chartYScale(domain: .automatic(includesZero: includesZero))) : AnyView(view.chartXScale(domain: .automatic(includesZero: includesZero)))
+            default:
+                break
+            }
             return view
-        case "chartXScale", "chartForegroundStyleScale", "chartPlotStyle", "chartBackground", "chartOverlay":
+        case "chartPlotStyle":
+            // `.chartPlotStyle { plotArea in plotArea.background(…).clipped() }`: run the closure on a
+            // stand-in view, then replay the modifiers it chained onto the real plot area.
+            let builder = m.args.last { if case .function = $0 { return true }; return false }
+            guard let plotView = r.content(builder, [.view(.empty)]).first else { return view }
+            var chain: [KModifier] = []
+            var node = plotView
+            while case .modified(let inner, let modifier) = node.kind { chain.insert(modifier, at: 0); node = inner }
+            guard !chain.isEmpty else { return view }
+            return AnyView(view.chartPlotStyle { plotArea in
+                chain.reduce(AnyView(plotArea)) { KModifiers.apply($1, to: $0, base: plotView, r) }
+            })
+        case "chartForegroundStyleScale", "chartBackground", "chartOverlay":
             return view
         default:
             interp.warn("The .\(m.name)() modifier isn't supported in Kiln yet, so it was skipped.")
@@ -617,10 +644,16 @@ struct KChartPoint: Identifiable {
     var xLabel = "x"
     var yLabel = "y"
     var angle: Double?
-    var color: Color?
+    /// `yStart:` / `yEnd:` of an AreaMark, BarMark or RectangleMark: the band the mark fills.
+    var yStart: Double?
+    var yEnd: Double?
+    /// A color, gradient or other ShapeStyle from `.foregroundStyle(_:)`.
+    var style: AnyShapeStyle?
     var series: String?
     var seriesLabel = "Series"
     var cornerRadius: Double?
+    var interpolation: InterpolationMethod?
+    var lineStyle: StrokeStyle?
 
     @MainActor
     init?(view: KView, renderer r: KRenderer) {
@@ -644,16 +677,32 @@ struct KChartPoint: Identifiable {
         if let (l, v) = plottable(a["x"]) { xLabel = l; x = v }
         if let (l, v) = plottable(a["y"]) { yLabel = l; y = v }
         if let (_, v) = plottable(a["angle"]), case .number(let n) = v { angle = n }
+        if let (l, v) = plottable(a["yStart"]), case .number(let n) = v { yStart = n; yLabel = l }
+        if let (l, v) = plottable(a["yEnd"]), case .number(let n) = v { yEnd = n; if y == nil { yLabel = l; y = v } }
         for m in modifiers {
             if m.name == "foregroundStyle" {
                 if let by = m.arg("by"), case .native(.implicit("value", let pa)) = by, pa.count >= 2 {
                     seriesLabel = r.string(pa[0]) ?? "Series"
                     series = r.string(pa[1])
-                } else if let c = r.color(m.first) {
-                    color = c
+                } else if let s = r.shapeStyle(m.first) {
+                    style = s
                 }
             }
             if m.name == "cornerRadius" { cornerRadius = m.first?.asDouble }
+            if m.name == "interpolationMethod", case .native(.implicit(let n, _))? = m.first {
+                switch n {
+                case "catmullRom": interpolation = .catmullRom
+                case "cardinal": interpolation = .cardinal
+                case "monotone": interpolation = .monotone
+                case "stepStart": interpolation = .stepStart
+                case "stepCenter": interpolation = .stepCenter
+                case "stepEnd": interpolation = .stepEnd
+                default: interpolation = .linear
+                }
+            }
+            if m.name == "lineStyle", case .native(.strokeStyle(let k))? = m.first {
+                lineStyle = StrokeStyle(lineWidth: k.lineWidth, lineCap: r.lineCap(k.lineCap), lineJoin: r.lineJoin(k.lineJoin), dash: k.dash.map { CGFloat($0) })
+            }
         }
     }
 
@@ -684,8 +733,14 @@ struct KChartView: View {
             SectorMark(angle: .value("Value", p.angle ?? 0), innerRadius: .ratio(0.5), angularInset: 1.5)
                 .foregroundStyle(by: .value(p.seriesLabel, p.series ?? "\(p.angle ?? 0)"))
         } else if p.kind == "RuleMark" {
-            RuleMark(y: .value(p.yLabel, p.yNumber))
-                .foregroundStyle(p.color ?? .red)
+            if let lineStyle = p.lineStyle {
+                RuleMark(y: .value(p.yLabel, p.yNumber))
+                    .foregroundStyle(p.style ?? AnyShapeStyle(.red))
+                    .lineStyle(lineStyle)
+            } else {
+                RuleMark(y: .value(p.yLabel, p.yNumber))
+                    .foregroundStyle(p.style ?? AnyShapeStyle(.red))
+            }
         } else if p.xIsText {
             styled(barOrLine(p, x: PlottableValue.value(p.xLabel, p.xText), y: PlottableValue.value(p.yLabel, p.yNumber)), p)
         } else if p.xIsDate {
@@ -699,11 +754,41 @@ struct KChartView: View {
 
     @ChartContentBuilder
     func barOrLine<X: Plottable, Y: Plottable>(_ p: KChartPoint, x: PlottableValue<X>, y: PlottableValue<Y>) -> some ChartContent {
+        // A band (`yStart:` + `yEnd:`) fills between the two values; otherwise marks fill from zero.
+        let band = p.yStart.map { (start: PlottableValue.value(p.yLabel, $0), end: PlottableValue.value(p.yLabel, p.yEnd ?? p.yNumber)) }
         switch p.kind {
-        case "LineMark": LineMark(x: x, y: y)
+        case "LineMark":
+            if let lineStyle = p.lineStyle {
+                LineMark(x: x, y: y)
+                    .interpolationMethod(p.interpolation ?? .linear)
+                    .lineStyle(lineStyle)
+            } else {
+                LineMark(x: x, y: y)
+                    .interpolationMethod(p.interpolation ?? .linear)
+            }
         case "PointMark": PointMark(x: x, y: y)
-        case "AreaMark": AreaMark(x: x, y: y)
-        default: BarMark(x: x, y: y)
+        case "AreaMark":
+            if let band {
+                AreaMark(x: x, yStart: band.start, yEnd: band.end)
+                    .interpolationMethod(p.interpolation ?? .linear)
+            } else {
+                AreaMark(x: x, y: y)
+                    .interpolationMethod(p.interpolation ?? .linear)
+            }
+        case "RectangleMark":
+            if let band {
+                RectangleMark(x: x, yStart: band.start, yEnd: band.end)
+            } else {
+                RectangleMark(x: x, y: y)
+            }
+        default:
+            if let band {
+                BarMark(x: x, yStart: band.start, yEnd: band.end)
+                    .cornerRadius(p.cornerRadius ?? 0)
+            } else {
+                BarMark(x: x, y: y)
+                    .cornerRadius(p.cornerRadius ?? 0)
+            }
         }
     }
 
@@ -712,7 +797,7 @@ struct KChartView: View {
         if let s = p.series {
             c.foregroundStyle(by: .value(p.seriesLabel, s))
         } else {
-            c.foregroundStyle(p.color ?? .accentColor)
+            c.foregroundStyle(p.style ?? AnyShapeStyle(Color.accentColor))
         }
     }
 }

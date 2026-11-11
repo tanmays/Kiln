@@ -599,8 +599,16 @@ struct KRenderer {
             let r = range(a["in"]) ?? 0...1
             return AnyView(Gauge(value: v, in: r) { renderContent(a.lastFunction) })
         case "Link":
-            if let t = string(a.first), case .native(.url(let u))? = a["destination"] { return AnyView(Link(t, destination: u)) }
-            return AnyView(Text(string(a.first) ?? ""))
+            // `Link(destination:) { … }` and `Link(destination:label:)` draw their label; only
+            // `Link("Title", destination:)` has a title. Reading `a.first` as the title in the label
+            // forms drew the destination URL in place of the label.
+            let label = a.lastFunction
+            let title = a.firstIsUnlabeled ? string(a.first) : nil
+            guard case .native(.url(let u))? = a["destination"] else {
+                return label.map { renderContent($0) } ?? AnyView(Text(title ?? ""))
+            }
+            if let label { return AnyView(Link(destination: u) { renderContent(label) }) }
+            return AnyView(Link(title ?? u.absoluteString, destination: u))
         case "Menu":
             if let t = a.first.flatMap({ if case .string(let s) = $0 { return s }; return nil }) {
                 return AnyView(Menu(t) { renderContent(a.firstFunction) })

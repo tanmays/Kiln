@@ -711,7 +711,12 @@ struct KRenderer {
         case "AnyView":
             return renderList(KBuiltins.asViews(a.first ?? .void, interp))
         case "ViewThatFits":
-            return AnyView(ViewThatFits { renderContent(a.lastFunction) })
+            // `in:` matters: on the default (both axes) every candidate is also measured at its
+            // ideal width, where text never wraps, so a list of rows never fits and the last
+            // candidate always wins.
+            var axes: SwiftUI.Axis.Set = [.horizontal, .vertical]
+            if case .native(.implicit(let n, _))? = a["in"] { axes = n == "horizontal" ? .horizontal : .vertical }
+            return AnyView(ViewThatFits(in: axes) { renderContent(a.lastFunction) })
         case "ContentUnavailableView":
             let title = string(a.first) ?? ""
             let icon = a["systemImage"].flatMap { string($0) } ?? "tray"
